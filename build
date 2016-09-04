@@ -1,0 +1,249 @@
+#!/bin/bash
+###############################################################################################################
+# author: milesgratz
+# website: serveradventures.com
+# purpose: script to automate building pwm (open source password self service) with LetsEncrypt HTTPS
+# links: https://github.com/milesgratz/pwm-droplet
+# links: https://github.com/pwm-project/pwm
+################################################################################################################
+
+# set variables for totally automated script
+mysqlpwd=''
+domain=''
+email=''
+
+# determine OS 
+dist=$(lsb_release -si)
+ver=$(lsb_release -sr | cut -d. -f1)
+
+# check if Ubuntu 16
+if ( [ $dist == 'Ubuntu' ] && [ $ver == '16' ] )
+then
+  # detected compatible operating system
+  echo '===================================================='
+  echo   'Starting installation...'
+  echo '===================================================='
+
+  # check if mysqlpwd was already defined, otherwise define it
+  if [ -z "$mysqlpwd" ]; 
+  then 
+    read -p "Please specify a MySQL database password: " mysqlpwd
+    if [ -z "$mysqlpwd" ];
+      then
+        echo '===================================================='
+        echo 'Database password cannot be null. Exiting...'
+        echo '===================================================='
+      exit
+    fi
+  fi
+
+  # check if domain name was already defined, otherwise define it
+  if [ -z "$domain" ];
+  then 
+    read -p "Please server domain name: " domain
+    if [ -z "$domain" ];
+      then
+        echo '===================================================='
+        echo 'Domain name cannot be null. Exiting...'
+        echo '===================================================='
+      exit
+    fi
+  fi 
+
+  # check if email was already defined, otherwise define it
+  if [ -z "$email" ];
+  then 
+    read -p "Please enter email address for authorizing LetsEncrypt: " email
+    if [ -z "$email" ];
+      then
+        echo '===================================================='
+        echo 'Email address cannot be null. Exiting...'
+        echo '===================================================='
+      exit
+    fi
+  fi 
+
+  # echo mysql root password to /var/cache/debconf/passwords.dat to prevent 'mysql-server' prompting for root password
+  echo "mysql-server mysql-server/root_password password $mysqlpwd" | debconf-set-selections
+  echo "mysql-server mysql-server/root_password_again password $mysqlpwd" | debconf-set-selections
+
+  # update and install required packages
+  apt-get update && apt-get -y install git unzip apache2 default-jdk mysql-server
+
+  # download LetsEncrypt from git
+  git clone https://github.com/letsencrypt/letsencrypt /opt/letsencrypt
+
+  # download and install latest stable tomcat build from Apache 
+  cd /tmp
+  wget http://www-us.apache.org/dist/tomcat/tomcat-8/v8.5.4/bin/apache-tomcat-8.5.4.tar.gz -O apache-tomcat-8.5.4.tar.gz
+  mkdir /opt/tomcat
+  tar xzvf apache-tomcat-8.5.4.tar.gz -C /opt/tomcat --strip-components=1
+
+  # create user and group for tomcat service
+  groupadd tomcat
+  useradd -p "$mysqlpwd" -s /bin/false -g tomcat -d /opt/tomcat tomcat
+
+  # update tomcat permissions
+  cd /opt/tomcat
+  chown -R tomcat *
+  chgrp -R tomcat conf/ webapps/
+  chmod g+rwx webapps
+  chmod g+r webapps/*
+
+  # allow java 90% memory heap
+  mem=$(free -m | grep -oP '\d+' | head -n 1)
+  if ! (($mem % 2 == 0))
+  then
+    mem=$(($((mem - 1))*9/10))
+  else
+    mem=$(($mem*9/10))
+  fi
+
+  # determine java location
+  javadir=$(update-java-alternatives -l | awk '{print $3}')
+
+  # create tomcat service
+  cd /etc/systemd/system
+  echo '[Unit]' > tomcat.service
+  echo 'Description=Apache Tomcat Web Application Container' >> tomcat.service
+  echo 'After=network.target' >> tomcat.service
+  echo '' >> tomcat.service
+  echo '[Service]' >> tomcat.service
+  echo 'Type=forking' >> tomcat.service
+  echo '' >> tomcat.service
+  echo "Environment=JAVA_HOME=$javadir/jre" >> tomcat.service
+  echo 'Environment=CATALINA_PID=/opt/tomcat/temp/tomcat.pid' >> tomcat.service
+  echo 'Environment=CATALINA_HOME=/opt/tomcat' >> tomcat.service
+  echo 'Environment=CATALINA_BASE=/opt/tomcat' >> tomcat.service
+  echo "Environment='CATALINA_OPTS=-Xms256M -Xmx$(echo $mem)M -server -XX:+UseParallelGC'" >> tomcat.service
+  echo "Environment='JAVA_OPTS=-Djava.awt.headless=true -Djava.security.egd=file:/dev/./urandom'" >> tomcat.service
+  echo '' >> tomcat.service
+  echo 'ExecStart=/opt/tomcat/bin/startup.sh' >> tomcat.service
+  echo 'ExecStop=/opt/tomcat/bin/shutdown.sh' >> tomcat.service
+  echo '' >> tomcat.service
+  echo 'User=tomcat' >> tomcat.service
+  echo 'Group=tomcat' >> tomcat.service
+  echo 'RestartSec=10' >> tomcat.service
+  echo 'Restart=always' >> tomcat.service
+  echo '' >> tomcat.service
+  echo '[Install]' >> tomcat.service
+  echo 'WantedBy=multi-user.target' >> tomcat.service
+
+  # start tomcat service
+  systemctl daemon-reload
+  systemctl start tomcat
+
+  # download latest stable build of pwm
+  cd /tmp
+  wget http://www.pwm-project.org/artifacts/pwm/pwm-1.8.0-SNAPSHOT-2016-04-20T16%3A09%3A30Z-pwm-bundle.zip -O pwm-1.8.0.zip
+  unzip pwm-1.8.0.zip
+
+  # install pwm at ROOT of Tomcat
+  rm -rf /opt/tomcat/webapps/ROOT
+  mv pwm.war /opt/tomcat/webapps/ROOT.war
+  
+  # update pwm applicationPath
+  until [ -f "/opt/tomcat/webapps/ROOT/WEB-INF/web.xml" ]; do
+    sleep 1
+  done
+  sed -i -e '0,/unspecified/s/unspecified/\/opt\/tomcat\/webapps\/ROOT\/WEB-INF/' /opt/tomcat/webapps/ROOT/WEB-INF/web.xml
+  sleep 60
+  
+  # install MySQL Connector/J (official JDBC driver)
+  cd /tmp
+  wget https://dev.mysql.com/get/Downloads/Connector-J/mysql-connector-java-5.1.39.tar.gz -O mysql-connector-java-5.1.39.tar.gz
+  tar -xvf mysql-connector-java-5.1.39.tar.gz --strip-components=1 mysql-connector-java-5.1.39/mysql-connector-java-5.1.39-bin.jar
+  mv mysql-connector-java-5.1.39-bin.jar /opt/tomcat/webapps/ROOT/WEB-INF/lib
+  
+  # enable tomcat service permanently
+  systemctl enable tomcat
+  systemctl restart tomcat
+
+  # run "mysql_secure_installation"
+  mysql --user="root" --password="$mysqlpwd" --execute="DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1')"
+  mysql --user="root" --password="$mysqlpwd" --execute="DELETE FROM mysql.user WHERE User=''"
+  mysql --user="root" --password="$mysqlpwd" --execute="DELETE FROM mysql.db WHERE Db='test' OR Db='test\_%'"
+  mysql --user="root" --password="$mysqlpwd" --execute="FLUSH PRIVILEGES;"
+
+  # create pwm user, pwm database, grant privileges, etc.
+  mysql --user="root" --password="$mysqlpwd" --execute="CREATE USER 'pwm'@'localhost' IDENTIFIED BY '$mysqlpwd';"
+  mysql --user="root" --password="$mysqlpwd" --execute="CREATE DATABASE pwm;"
+  mysql --user="root" --password="$mysqlpwd" --execute="GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP ON pwm.* TO 'pwm'@'localhost';"
+  mysql --user="root" --password="$mysqlpwd" --execute="FLUSH PRIVILEGES;"
+
+  # create LetsEncrypt config file
+  echo 'authenticator = standalone' >> /opt/letsencrypt/$(hostname).ini 
+  echo 'agree-tos' >> /opt/letsencrypt/$(hostname).ini
+  echo "email = $email" >> /opt/letsencrypt/$(hostname).ini
+  echo "domain = $domain" >> /opt/letsencrypt/$(hostname).ini
+
+  # create LetsEncrypt certificate
+  systemctl stop apache2
+  /opt/letsencrypt/letsencrypt-auto certonly --config /opt/letsencrypt/$(hostname).ini
+
+  # create tomcat.conf in /etc/apache2/sites-available
+  cd /etc/apache2/sites-available
+  echo '<VirtualHost *:80>' > tomcat.conf
+  echo '      # redirect to https' >> tomcat.conf
+  echo "      Redirect permanent / https://$domain/" >> tomcat.conf
+  echo '</VirtualHost>' >> tomcat.conf
+  echo '' >> tomcat.conf
+  echo '<VirtualHost *:443>' >> tomcat.conf
+  echo '      # LogLevel info ssl:warn' >> tomcat.conf
+  echo '      ErrorLog ${APACHE_LOG_DIR}/error.log' >> tomcat.conf
+  echo '      CustomLog ${APACHE_LOG_DIR}/access.log combined' >> tomcat.conf
+  echo '' >> tomcat.conf
+  echo '      # Enable SSL for this virtual host.' >> tomcat.conf
+  echo '      SSLEngine on' >> tomcat.conf
+  echo "      SSLCertificateKeyFile /etc/letsencrypt/live/$domain/privkey.pem" >> tomcat.conf
+  echo "      SSLCertificateFile /etc/letsencrypt/live/$domain/cert.pem" >> tomcat.conf
+  echo "      SSLCertificateChainFile /etc/letsencrypt/live/$domain/chain.pem" >> tomcat.conf
+  echo '' >> tomcat.conf
+  echo '      # Configure proxy with tomcat' >> tomcat.conf
+  echo '      ProxyPreserveHost On' >> tomcat.conf
+  echo '      ProxyRequests Off' >> tomcat.conf
+  echo '      ProxyPass / http://localhost:8080/' >> tomcat.conf
+  echo '      ProxyPassReverse / http://localhost:8080/' >> tomcat.conf
+  echo '</VirtualHost>' >> tomcat.conf
+
+  # enable SSL/proxy for apache2
+  a2enmod ssl
+  a2enmod proxy
+  a2enmod proxy_http
+
+  # disable default site and enable tomcat.conf
+  a2dissite 000-default
+  a2ensite tomcat
+ 
+  # restart apache2
+  systemctl restart apache2
+ 
+  # allow ssh/http/https and enable firewall (ufw)
+  ufw allow ssh
+  ufw allow 80
+  ufw allow 443
+  ufw --force enable
+
+  # define IP address of server
+  ip=$(ip addr | grep 'state UP' -A2 | tail -n1 | awk '{print $2}' | cut -f1  -d'/')
+
+  # script is finished
+  echo '========================================================================'
+  echo 'pwm has been installed. Default login below:' 
+  echo
+  echo "  Website URL:     https://$domain"
+  echo "  Website IP:      https://$ip"
+  echo "  Email address:   $(hostname)@digitalocean.com"
+  echo
+  echo '  MySQL User:      root'
+  echo "  MySQL Pwd:       $mysqlpwd"
+  echo
+  echo '========================================================================'
+
+else
+  # could not find compatible operating system
+  echo '========================================================================'
+  echo 'ERROR. Could not detect compatible operating system...' 		
+  echo '========================================================================'
+
+fi
